@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Collected, Full, StreamBody};
+use hyper::body::{Body, Incoming};
 use hyper::service::Service;
 use hyper::{body, Request};
 use hyper::{server::conn::http1, service::service_fn, Method, Response, StatusCode};
@@ -96,25 +96,50 @@ where
     general_purpose::STANDARD.encode(input)
 }
 
-struct HyperService<'a> {
+struct HyperService {
     context: Arc<Context>,
-    schema: Arc<RootNode<'a, Query, EmptyMutation<Context>, EmptySubscription<Context>>>,
+    schema: Arc<RootNode<'static, Query, EmptyMutation<Context>, EmptySubscription<Context>>>,
 }
 
-impl<'a> Service<Request<Incoming>> for HyperService<'a> {
+impl Service<Request<Incoming>> for HyperService {
     type Response = Response<String>;
     type Error = hyper::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
-        let _res = match (req.method(), req.uri().path()) {
-            // (&Method::GET, "/") => {
-            //     let result = juniper_hyper::graphiql("/graphql", None);
+        let (parts, body) = req.into_parts();
+        let context = self.context.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            match (&parts.method, parts.uri.path()) {
+                (&Method::GET, "/") => {
+                    let result = juniper_hyper::graphiql("/graphql", None).await;
 
-            //     return Box::pin(async { result.then(|r| async move { Ok(r) }) });
-            // }
-            _ => return Box::pin(async { Ok(Response::builder().body(String::new()).unwrap()) }),
-        };
-        // Box::pin(async { res })
+                    Ok(result)
+                }
+                (&Method::POST, "/graphql") => {
+                    let body: Result<_, _> = body.collect().await;
+                    let body = match body {
+                        Ok(body) => body,
+                        Err(err) => {
+                            eprintln!("Error reading request body {:?}", err);
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body("Could not read request body".to_string())
+                                .unwrap());
+                        }
+                    };
+                    let body: Bytes = body.to_bytes();
+                    let res = juniper_hyper::graphql(
+                        schema,
+                        context,
+                        Request::from_parts(parts, body.into()),
+                    )
+                    .await;
+                    Ok(res)
+                }
+                _ => Ok(Response::builder().body(String::new()).unwrap()),
+            }
+        })
     }
 }
 

@@ -1,0 +1,23 @@
+{
+	"containerUser": "dev",
+	"extensions": [
+		"vadimcn.vscode-lldb",
+		"panicbit.cargo",
+		"rust-lang.rust-analyzer",
+		"serayuzgur.crates",
+		"tamasfe.even-better-toml"
+	],
+	"image": "thetrompf/rust-dev:1.66.1-slim-bullseye",
+	"mounts": [
+		"source=graphql-rust-dev-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+		// "source=graphql-rust-vscode-server,target=/home/dev/.vscode-server/extensions,type=volume",
+		"source=${localEnv:HOME}/.homesick,target=/home/dev/.homesick,type=bind,consistency=ro"
+	],
+	"postCreateCommand": ["/home/dev/.homesick/repos/homeshick/bin/homeshick", "link", "-f"],
+	"name": "graphql-rust",
+	"remoteUser": "dev",
+	"settings": {
+		"rust-analyzer.checkOnSave.command": "clippy",
+		"terminal.integrated.defaultProfile.linux": "zsh"
+	}
+}

@@ -1,0 +1,7 @@
+*.log
+/.dockerignore
+/docker/*.Dockerfile
+
+/.devcontainer/
+/scripts/
+/target/

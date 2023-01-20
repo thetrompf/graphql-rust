@@ -1,22 +1,23 @@
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use base64::{engine::general_purpose, Engine as _};
-use bytes::Bytes;
-use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper::service::Service;
-use hyper::{body, Request};
-use hyper::{server::conn::http1, service::service_fn, Method, Response, StatusCode};
-use juniper::futures::future::Then;
-use juniper::futures::FutureExt;
+use juniper::http::graphiql::graphiql_source;
 use juniper::{
-    graphql_object, EmptyMutation, EmptySubscription, FieldResult, GraphQLObject, GraphQLScalar,
-    InputValue, RootNode, ScalarValue, Value,
+    graphql_object, DefaultScalarValue, EmptyMutation, EmptySubscription, ExecutionError,
+    FieldResult, GraphQLError, GraphQLObject, GraphQLScalar, InputValue, RootNode, ScalarValue,
+    Value,
 };
-use std::future::Future;
-use std::pin::Pin;
-use std::{convert::Infallible, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::{net::SocketAddr, str::Utf8Error};
-use tokio::net::TcpListener;
+
+#[derive(Clone)]
 struct Context;
+
 impl Context {
     fn new() -> Self {
         Context {}
@@ -25,7 +26,7 @@ impl Context {
 impl juniper::Context for Context {}
 
 #[derive(GraphQLScalar, Debug)]
-#[graphql(name = "ID", to_output_with = to_id_output, transparent)]
+#[graphql(name = "ID", to_output_with = to_id_output, from_input_with = ViewerID::from_input, transparent)]
 pub struct ViewerID(i32);
 
 impl ViewerID {
@@ -96,28 +97,6 @@ where
     general_purpose::STANDARD.encode(input)
 }
 
-struct HyperService<'a> {
-    context: Arc<Context>,
-    schema: Arc<RootNode<'a, Query, EmptyMutation<Context>, EmptySubscription<Context>>>,
-}
-
-impl<'a> Service<Request<Incoming>> for HyperService<'a> {
-    type Response = Response<String>;
-    type Error = hyper::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
-        let _res = match (req.method(), req.uri().path()) {
-            // (&Method::GET, "/") => {
-            //     let result = juniper_hyper::graphiql("/graphql", None);
-
-            //     return Box::pin(async { result.then(|r| async move { Ok(r) }) });
-            // }
-            _ => return Box::pin(async { Ok(Response::builder().body(String::new()).unwrap()) }),
-        };
-        // Box::pin(async { res })
-    }
-}
-
 // let new_service = make_service_fn(move |_| {
 //     let root_node = schema.clone();
 //     let ctx = context.clone();
@@ -144,8 +123,99 @@ impl<'a> Service<Request<Incoming>> for HyperService<'a> {
 //     }
 // });
 
+type Schema = RootNode<'static, Query, EmptyMutation<Context>, EmptySubscription<Context>>;
+
+enum RequestError {
+    Something(String),
+}
+
+impl IntoResponse for RequestError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Something(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+        }
+    }
+}
+
+impl From<GraphQLError> for RequestError {
+    fn from(value: GraphQLError) -> Self {
+        Self::Something(value.to_string())
+    }
+}
+
+async fn graphiql() -> Result<Html<String>, RequestError> {
+    let text = graphiql_source("/graphql", None);
+    Ok(Html(text))
+}
+
+#[derive(Deserialize)]
+struct GraphQLRequest {
+    query: String,
+    variables: Option<HashMap<String, InputValue>>,
+}
+
+#[derive(Serialize)]
+struct GraphQLResponse {
+    data: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    errors: Option<Vec<ExecutionError<DefaultScalarValue>>>,
+}
+
+impl GraphQLResponse {
+    fn new(data: Value, errors: Option<Vec<ExecutionError<DefaultScalarValue>>>) -> Self {
+        Self { data, errors }
+    }
+}
+
+async fn execute_request(
+    query: String,
+    variables: Option<HashMap<String, InputValue>>,
+    schema: &Schema,
+    context: &Context,
+) -> Result<Json<GraphQLResponse>, RequestError> {
+    let vars = variables.unwrap_or_else(|| HashMap::new());
+    let (result, errors) = juniper::execute(&query, None, &schema, &vars, &context).await?;
+
+    Ok(Json(GraphQLResponse::new(
+        result,
+        if errors.len() == 0 {
+            None
+        } else {
+            Some(errors)
+        },
+    )))
+}
+
+async fn graphql_post(
+    State(RequestState { schema, context }): State<RequestState>,
+    Json(body): Json<GraphQLRequest>,
+) -> Result<Json<GraphQLResponse>, RequestError> {
+    let GraphQLRequest { query, variables } = body;
+    execute_request(query, variables, &schema, &context).await
+}
+
+async fn graphql_get(
+    State(RequestState { schema, context }): State<RequestState>,
+    axum::extract::Query(params): axum::extract::Query<GraphQLRequest>,
+) -> Result<Json<GraphQLResponse>, RequestError> {
+    let GraphQLRequest { query, variables } = params;
+    execute_request(query, variables, &schema, &context).await
+}
+
+#[derive(Clone)]
+struct RequestState {
+    context: Arc<Context>,
+    schema: Arc<Schema>,
+}
+
+impl RequestState {
+    pub fn new(context: Arc<Context>, schema: Arc<Schema>) -> Self {
+        Self { context, schema }
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), anyhow::Error> {
     // pretty_env_logger::init();
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -157,50 +227,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         EmptySubscription::<Context>::new(),
     ));
 
-    let listener = TcpListener::bind(&addr).await?;
-    println!("Listening on http://{}", addr);
+    let service = Router::new()
+        .route("/", get(graphiql))
+        .route("/graphql", post(graphql_post).get(graphql_get))
+        .with_state(RequestState::new(context, schema))
+        .into_make_service();
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let root_node = schema.clone();
-        let ctx = context.clone();
+    axum::Server::bind(&addr).serve(service).await?;
 
-        tokio::task::spawn(async move {
-            let root_node = root_node.clone();
-            let ctx = ctx.clone();
-
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    stream,
-                    HyperService {
-                        context: ctx,
-                        schema: root_node,
-                    }, // let root_node = schema.clone();
-                       // let ctx = context.clone();
-
-                       // async {
-                       //     Ok::<_, Infallible>(match (req.method(), req.uri().path()) {
-                       // (&Method::GET, "/") => {
-                       //     juniper_hyper::graphiql("/graphql", None).await
-                       // }
-                       // (&Method::GET, "/graphql") | (&Method::POST, "/graphql") => {
-                       //     juniper_hyper::graphql(root_node, ctx, req).await
-                       // }
-                       // _ => {
-                       // let mut response = Response::new(String::new());
-                       // *response.status_mut() = StatusCode::NOT_FOUND;
-                       // Ok(response)
-                       // }
-                       // })
-                       // }
-                       // }),
-                )
-                .await
-            {
-                println!("Error serving connection: {:?}", err);
-            }
-        });
-    }
+    Ok(())
 }
 
 #[cfg(test)]
